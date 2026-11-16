@@ -1,0 +1,151 @@
+"""Download, clean and persist the track catalogue.
+
+The raw dataset has several quality issues that matter for a recommender:
+
+* the same ``track_id`` appears once per genre it was sampled under, so a
+  naive model would recommend the seed track back to the user;
+* the same song (title + artists) is often released several times
+  (single, album, deluxe, compilation) under different ``track_id`` values;
+* some rows have failed audio analysis (``tempo == 0``) or are not songs at
+  all (sub-30-second clips, multi-hour mixes).
+
+:func:`clean` resolves these and returns an audit trail of every step.
+"""
+
+from __future__ import annotations
+
+import logging
+import shutil
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pandas as pd
+
+from music_recommender.config import (
+    AUDIO_FEATURES,
+    DATASET_URL,
+    MAX_DURATION_MS,
+    MIN_DURATION_MS,
+    PROCESSED_PATH,
+    RAW_PATH,
+)
+
+logger = logging.getLogger(__name__)
+
+REQUIRED_COLUMNS = [
+    "track_id",
+    "artists",
+    "album_name",
+    "track_name",
+    "popularity",
+    "explicit",
+    "track_genre",
+    *AUDIO_FEATURES,
+]
+
+
+@dataclass
+class CleaningReport:
+    """Row counts after each cleaning step, for transparency."""
+
+    steps: list[tuple[str, int]] = field(default_factory=list)
+
+    def log(self, step: str, df: pd.DataFrame) -> None:
+        self.steps.append((step, len(df)))
+        logger.info("%-55s %8d rows", step, len(df))
+
+    def to_frame(self) -> pd.DataFrame:
+        out = pd.DataFrame(self.steps, columns=["step", "rows"])
+        out["rows_removed"] = (-out["rows"].diff()).fillna(0).astype(int)
+        return out
+
+
+def download(url: str = DATASET_URL, dest: Path = RAW_PATH, force: bool = False) -> Path:
+    """Download the raw CSV (skipped if it already exists)."""
+    if dest.exists() and not force:
+        logger.info("Raw data already present at %s", dest)
+        return dest
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(".part")
+    logger.info("Downloading %s", url)
+    with urllib.request.urlopen(url, timeout=120) as resp, open(tmp, "wb") as fh:
+        shutil.copyfileobj(resp, fh)
+    tmp.replace(dest)
+    return dest
+
+
+def load_raw(path: Path = RAW_PATH) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    missing = set(REQUIRED_COLUMNS) - set(df.columns)
+    if missing:
+        raise ValueError(f"Raw data is missing columns: {sorted(missing)}")
+    return df[REQUIRED_COLUMNS]
+
+
+def _normalise_text(s: pd.Series) -> pd.Series:
+    return s.str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
+
+
+def clean(raw: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
+    """Turn the raw genre-sampled rows into one row per unique song."""
+    report = CleaningReport()
+    df = raw.copy()
+    report.log("raw rows", df)
+
+    df = df.dropna(subset=["track_id", "track_name", "artists"])
+    report.log("drop rows with missing title/artist", df)
+
+    valid = (df["tempo"] > 0) & (df["duration_ms"].between(MIN_DURATION_MS, MAX_DURATION_MS))
+    df = df[valid]
+    report.log("drop failed audio analysis / non-song durations", df)
+
+    # One row per track_id, collecting every genre it was listed under.
+    genres = df.groupby("track_id")["track_genre"].agg(lambda g: sorted(set(g)))
+    df = df.drop_duplicates("track_id").drop(columns="track_genre")
+    df = df.merge(genres.rename("genres"), left_on="track_id", right_index=True)
+    report.log("merge duplicate track_ids (multi-genre listings)", df)
+
+    # Same song released multiple times: keep the most popular release,
+    # but union the genres from all releases.
+    df["_song_key"] = _normalise_text(df["track_name"]) + "||" + _normalise_text(df["artists"])
+    song_genres = df.groupby("_song_key")["genres"].agg(
+        lambda gs: sorted({g for lst in gs for g in lst})
+    )
+    df = df.sort_values("popularity", ascending=False).drop_duplicates("_song_key")
+    df["genres"] = df["_song_key"].map(song_genres)
+    df = df.drop(columns="_song_key")
+    report.log("merge re-releases of the same song", df)
+
+    df["artist_list"] = df["artists"].str.split(";")
+    df["primary_artist"] = df["artist_list"].str[0].str.strip()
+    df["artists"] = df["artist_list"].str.join(", ")
+    df = df.drop(columns="artist_list")
+    df["explicit"] = df["explicit"].astype(bool)
+    df["popularity"] = df["popularity"].astype(int)
+
+    df = df.sort_values("popularity", ascending=False).reset_index(drop=True)
+    return df, report
+
+
+def build(raw_path: Path = RAW_PATH, out_path: Path = PROCESSED_PATH) -> CleaningReport:
+    """Run the full raw -> processed pipeline and write a parquet file."""
+    tracks, report = clean(load_raw(raw_path))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tracks.to_parquet(out_path, index=False)
+    logger.info("Wrote %d tracks to %s", len(tracks), out_path)
+    return report
+
+
+def load_tracks(path: Path = PROCESSED_PATH) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    df["genres"] = df["genres"].map(list)
+    return df
+
+
+def ensure_tracks(path: Path = PROCESSED_PATH) -> pd.DataFrame:
+    """Load processed tracks, downloading and building them if needed."""
+    if not path.exists():
+        download()
+        build(out_path=path)
+    return load_tracks(path)
