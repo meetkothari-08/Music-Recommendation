@@ -110,16 +110,29 @@ def make_artist_tasks(
     n_seeds: int = 3,
     min_tracks: int = 6,
     seed: int = 42,
+    exclude_artists: set[str] | None = None,
 ) -> list[Task]:
+    """Draw artist-continuation tasks (one per artist).
+
+    ``exclude_artists`` removes artists from the pool, e.g. to build ranker
+    training tasks that are disjoint from the validation and test artists.
+    """
     rng = np.random.default_rng(seed)
     groups = tracks.groupby("primary_artist").indices
-    eligible = sorted(a for a, ix in groups.items() if len(ix) >= min_tracks)
+    exclude = exclude_artists or set()
+    eligible = sorted(a for a, ix in groups.items() if len(ix) >= min_tracks and a not in exclude)
     chosen = rng.choice(eligible, size=min(n_tasks, len(eligible)), replace=False)
     tasks = []
     for artist in chosen:
         ix = rng.permutation(groups[artist])
         tasks.append(Task(seeds=ix[:n_seeds], targets=ix[n_seeds:]))
     return tasks
+
+
+def task_artists(tracks: pd.DataFrame, tasks: list[Task]) -> set[str]:
+    """The artists a task list was built from."""
+    artists = tracks["primary_artist"].to_numpy()
+    return {artists[t.seeds[0]] for t in tasks}
 
 
 # ------------------------------------------------------------------- metrics
@@ -150,8 +163,9 @@ class Evaluator:
         self.genres = self.tracks["genres"].map(set).to_numpy()
         self.popularity = self.tracks["popularity"].to_numpy()
 
-    def evaluate(self, model: Recommender) -> dict[str, float]:
-        rows, seen = [], set()
+    def per_task(self, model: Recommender) -> pd.DataFrame:
+        """One row of metrics per task, plus the recommended indices."""
+        rows = []
         for task in self.tasks:
             recs, _ = model.recommend_indices(task.seeds, self.k)
             hits = np.isin(recs, task.targets).astype(float)
@@ -164,29 +178,56 @@ class Evaluator:
                     "genre_precision": np.mean([bool(self.genres[i] & seed_genres) for i in recs]),
                     "diversity": intra_list_diversity(self.audio[recs]),
                     "avg_popularity": self.popularity[recs].mean(),
+                    "recs": recs,
                 }
             )
-            seen.update(recs.tolist())
-        df = pd.DataFrame(rows)
+        return pd.DataFrame(rows)
+
+    def summarise(self, per_task: pd.DataFrame) -> dict[str, float]:
+        df = per_task.drop(columns="recs")
         n = len(df)
         out = df.mean().to_dict()
         out["ndcg_ci95"] = 1.96 * df["ndcg"].std(ddof=1) / np.sqrt(n)
         out["hit_rate_ci95"] = 1.96 * df["hit_rate"].std(ddof=1) / np.sqrt(n)
-        out["coverage"] = len(seen) / len(self.tracks)
+        out["coverage"] = len(set(np.concatenate(per_task["recs"].to_list()))) / len(self.tracks)
         return out
+
+    def evaluate(self, model: Recommender) -> dict[str, float]:
+        return self.summarise(self.per_task(model))
 
     def compare(self, models: dict[str, Recommender]) -> pd.DataFrame:
         return pd.DataFrame({name: self.evaluate(m) for name, m in models.items()}).T
 
 
-def default_model_suite(tracks: pd.DataFrame) -> dict[str, Recommender]:
-    """Baselines plus the content model's ablations."""
+def paired_difference(a: pd.DataFrame, b: pd.DataFrame, metric: str = "ndcg") -> dict[str, float]:
+    """Mean per-task difference ``a - b`` on the same tasks, with a 95% CI."""
+    diff = a[metric].to_numpy() - b[metric].to_numpy()
+    ci = 1.96 * diff.std(ddof=1) / np.sqrt(len(diff))
+    return {
+        "mean": float(diff.mean()),
+        "ci95": float(ci),
+        "wins": int((diff > 0).sum()),
+        "losses": int((diff < 0).sum()),
+    }
+
+
+RANKER_NAME = "Two-stage: retrieval + LightGBM ranker"
+
+
+def default_model_suite(tracks: pd.DataFrame, ranker=None) -> dict[str, Recommender]:
+    """Baselines plus the content model's ablations.
+
+    ``ranker`` is an already-trained :class:`~music_recommender.ranker.LearnedRanker`.
+    It is passed in rather than trained here because it must be trained on
+    artists disjoint from the evaluation tasks, which only the caller knows
+    (see :func:`music_recommender.reporting.run`).
+    """
 
     def content(**kw) -> ContentRecommender:
         return ContentRecommender(**kw).fit(tracks)
 
     final = content()  # tuned defaults
-    return {
+    suite: dict[str, Recommender] = {
         "Random": RandomRecommender(tracks),
         "Popularity": PopularityRecommender(tracks),
         "Genre popularity": GenrePopularityRecommender(tracks),
@@ -197,6 +238,9 @@ def default_model_suite(tracks: pd.DataFrame) -> dict[str, Recommender]:
         "Audio + genre one-hot": ContentModelAdapter(final, diversity=0.0),
         "Audio + genre one-hot + MMR (final)": ContentModelAdapter(final),
     }
+    if ranker is not None:
+        suite[RANKER_NAME] = ranker
+    return suite
 
 
 def weight_sweep(
@@ -218,4 +262,31 @@ def diversity_sweep(
         {"diversity_lambda": lam, **evaluator.evaluate(ContentModelAdapter(model, lam))}
         for lam in lambdas
     ]
+    return pd.DataFrame(rows)
+
+
+class _CachedScores:
+    """Scores each query once so an MMR sweep doesn't re-run both stages."""
+
+    def __init__(self, ranker) -> None:
+        self.ranker = ranker
+        self.cache: dict[tuple, tuple[np.ndarray, np.ndarray]] = {}
+        self.diversity = 0.0
+
+    def recommend_indices(self, seed_idx, k):
+        key = tuple(seed_idx)
+        if key not in self.cache:
+            self.cache[key] = self.ranker.score(seed_idx)
+        return self.ranker.rerank(*self.cache[key], k, self.diversity)
+
+
+def ranker_diversity_sweep(
+    evaluator: Evaluator, ranker, lambdas=(0.0, 0.1, 0.2, 0.3, 0.4, 0.5)
+) -> pd.DataFrame:
+    """MMR λ applied after the learned ranker (tune on validation tasks)."""
+    cached = _CachedScores(ranker)
+    rows = []
+    for lam in lambdas:
+        cached.diversity = lam
+        rows.append({"diversity_lambda": lam, **evaluator.evaluate(cached)})
     return pd.DataFrame(rows)
