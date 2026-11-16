@@ -1,6 +1,15 @@
 import pandas as pd
+import pytest
 
-from music_recommender.data import clean
+from music_recommender.data import (
+    base_title,
+    build,
+    clean,
+    download,
+    load_raw,
+    load_tracks,
+    recording_title,
+)
 
 
 def test_clean_merges_multi_genre_duplicates(raw):
@@ -46,3 +55,77 @@ def test_clean_splits_artists(raw):
     row = cleaned.set_index("track_id").loc["feat"]
     assert row.primary_artist == "Main"
     assert row.artists == "Main, Guest"
+
+
+def _variant(raw, track_id, title, popularity=50):
+    row = raw.iloc[[0]].copy()
+    row["track_id"] = track_id
+    row["track_name"] = title
+    row["popularity"] = popularity
+    return row
+
+
+def test_remasters_merge_but_live_versions_stay(raw):
+    variants = pd.concat(
+        [
+            _variant(raw, "orig", "Anthem", 40),
+            _variant(raw, "remaster", "Anthem - Remastered 2011", 90),
+            _variant(raw, "mono", "Anthem (Mono)", 10),
+            _variant(raw, "live", "Anthem - Live at Wembley", 30),
+        ]
+    )
+    cleaned, _ = clean(pd.concat([raw, variants], ignore_index=True))
+    ids = set(cleaned.track_id)
+    assert "remaster" in ids  # most popular release of the recording wins
+    assert not {"orig", "mono"} & ids
+    assert "live" in ids  # a live version is a different recording
+    groups = cleaned.set_index("track_id").song_group
+    assert groups["live"] == groups["remaster"]  # ...but the same song
+
+
+def test_title_normalisation():
+    titles = pd.Series(
+        [
+            "Hey Jude - 2015 Remaster",
+            "Help! (Remastered 2009)",
+            "Creep - Acoustic",
+            "(I Can't Get No) Satisfaction",
+            "Song (feat. X) [Radio Edit]",
+            "(Intro)",
+        ]
+    )
+    assert recording_title(titles).tolist() == [
+        "hey jude",
+        "help!",
+        "creep - acoustic",
+        "(i can't get no) satisfaction",
+        "song (feat. x) [radio edit]",
+        "(intro)",
+    ]
+    assert base_title(titles).tolist() == [
+        "hey jude",
+        "help!",
+        "creep",
+        "(i can't get no) satisfaction",
+        "song",
+        "(intro)",
+    ]
+
+
+def test_download_and_build_roundtrip(raw, tmp_path):
+    src = tmp_path / "source.csv"
+    raw.to_csv(src)  # the real file also has a leading unnamed index column
+    raw_path = download(url=src.as_uri(), dest=tmp_path / "raw" / "tracks.csv")
+    assert raw_path.exists()
+    out = tmp_path / "processed" / "tracks.parquet"
+    report = build(raw_path=raw_path, out_path=out)
+    loaded = load_tracks(out)
+    assert len(loaded) == report.steps[-1][1]
+    assert isinstance(loaded.genres.iloc[0], list)
+
+
+def test_load_raw_rejects_wrong_schema(tmp_path):
+    bad = tmp_path / "bad.csv"
+    pd.DataFrame({"track_id": ["a"]}).to_csv(bad, index=False)
+    with pytest.raises(ValueError, match="missing columns"):
+        load_raw(bad)

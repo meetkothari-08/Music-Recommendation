@@ -48,6 +48,20 @@ def _cmd_recommend(args: argparse.Namespace) -> None:
         print(out[["similarity", "track_name", "artists", "genres", "popularity"]].to_string())
 
 
+def _positive_int(value: str) -> int:
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return n
+
+
+def _unit_float(value: str) -> float:
+    x = float(value)
+    if not 0.0 <= x <= 1.0:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return x
+
+
 def main(argv: list[str] | None = None) -> None:
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(prog="music-rec", description=__doc__)
@@ -60,13 +74,13 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("build", help="clean raw data into data/processed").set_defaults(func=_cmd_build)
 
     p = sub.add_parser("evaluate", help="run offline evaluation and write reports/")
-    p.add_argument("--n-tasks", type=int, default=1000)
+    p.add_argument("--n-tasks", type=_positive_int, default=1000)
     p.set_defaults(func=_cmd_evaluate)
 
     p = sub.add_parser("recommend", help="recommend from one or more seed songs")
     p.add_argument("query", nargs="+", help='seed song searches, e.g. "blinding lights"')
-    p.add_argument("-k", type=int, default=10)
-    p.add_argument("--diversity", type=float, default=0.3)
+    p.add_argument("-k", type=_positive_int, default=10)
+    p.add_argument("--diversity", type=_unit_float, default=0.3)
     p.add_argument("--new-artists", action="store_true", help="exclude the seed artists")
     p.set_defaults(func=_cmd_recommend)
 

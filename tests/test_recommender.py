@@ -94,3 +94,26 @@ def test_mmr_avoids_near_duplicates():
     rel = np.array([1.0, 0.99, 0.5])
     assert list(mmr_rerank(vecs, rel, 2, 0.0)) == [0, 1]
     assert list(mmr_rerank(vecs, rel, 2, 0.6)) == [0, 2]
+
+
+def test_never_recommends_another_version_of_a_seed(raw):
+    from music_recommender.data import clean
+
+    live = raw.iloc[[0]].copy()
+    live["track_id"] = "live-version"
+    live["track_name"] = raw.track_name.iloc[0] + " - Live"
+    tracks, _ = clean(__import__("pandas").concat([raw, live], ignore_index=True))
+    rec = ContentRecommender(diversity=0.0).fit(tracks)
+    out = rec.recommend([raw.track_id.iloc[0]], k=len(tracks) - 2)
+    assert "live-version" not in set(out.track_id)
+
+
+@pytest.mark.parametrize("kwargs", [{"k": 0}, {"diversity": -0.1}, {"diversity": 1.5}])
+def test_invalid_arguments_raise(rec, kwargs):
+    with pytest.raises(ValueError):
+        rec.recommend([seed_of(rec, "pop_artist_0")], **kwargs)
+
+
+def test_search_matches_album_names(rec):
+    hits = rec.search("edm_artist_2 album")
+    assert len(hits) > 0 and (hits.primary_artist == "edm_artist_2").all()

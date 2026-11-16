@@ -87,6 +87,37 @@ def _normalise_text(s: pd.Series) -> pd.Series:
     return s.str.lower().str.replace(r"\s+", " ", regex=True).str.strip()
 
 
+# Suffixes that label the *same recording* (e.g. "Song - Remastered 2011",
+# "Song (Mono)", "Song - Single Version"). Live, acoustic and remix versions
+# are deliberately NOT stripped: they sound different and are kept as songs.
+_SAME_RECORDING_SUFFIX = (
+    r"\s*(?:-\s+|\(|\[)\s*"
+    r"(?:\d{4}\s+)?(?:digital(?:ly)?\s+)?"
+    r"(?:remaster(?:ed)?(?:\s+\d{4})?(?:\s+version)?|mono|stereo|single version|album version)"
+    r"\s*[)\]]?\s*$"
+)
+
+# Any trailing version label: " - Live", "(Acoustic)", "[Radio Edit]", "(feat. X)".
+_ANY_VERSION_SUFFIX = r"\s*(?:\s-\s.*|\([^()]*\)|\[[^\[\]]*\])\s*$"
+
+
+def recording_title(titles: pd.Series) -> pd.Series:
+    """Normalised title with same-recording labels (remaster, mono...) removed."""
+    out = _normalise_text(titles)
+    for _ in range(2):  # handle stacked suffixes, e.g. "(mono) - remastered"
+        out = out.str.replace(_SAME_RECORDING_SUFFIX, "", regex=True).str.strip()
+    return out
+
+
+def base_title(titles: pd.Series) -> pd.Series:
+    """Normalised title with every trailing version label removed."""
+    out = _normalise_text(titles)
+    for _ in range(3):
+        stripped = out.str.replace(_ANY_VERSION_SUFFIX, "", regex=True).str.strip()
+        out = stripped.where(stripped != "", out)  # never strip a title to nothing
+    return out
+
+
 def clean(raw: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
     """Turn the raw genre-sampled rows into one row per unique song."""
     report = CleaningReport()
@@ -106,9 +137,9 @@ def clean(raw: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
     df = df.merge(genres.rename("genres"), left_on="track_id", right_index=True)
     report.log("merge duplicate track_ids (multi-genre listings)", df)
 
-    # Same song released multiple times: keep the most popular release,
-    # but union the genres from all releases.
-    df["_song_key"] = _normalise_text(df["track_name"]) + "||" + _normalise_text(df["artists"])
+    # Same recording released multiple times (single, album, remaster...):
+    # keep the most popular release, but union the genres from all releases.
+    df["_song_key"] = recording_title(df["track_name"]) + "||" + _normalise_text(df["artists"])
     song_genres = df.groupby("_song_key")["genres"].agg(
         lambda gs: sorted({g for lst in gs for g in lst})
     )
@@ -121,6 +152,9 @@ def clean(raw: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
     df["primary_artist"] = df["artist_list"].str[0].str.strip()
     df["artists"] = df["artist_list"].str.join(", ")
     df = df.drop(columns="artist_list")
+    # Groups all versions of a song (live, acoustic, remix...) so the
+    # recommender never suggests another version of a seed.
+    df["song_group"] = base_title(df["track_name"]) + "||" + df["primary_artist"].str.lower()
     df["explicit"] = df["explicit"].astype(bool)
     df["popularity"] = df["popularity"].astype(int)
 

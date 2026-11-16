@@ -79,8 +79,13 @@ class ContentRecommender:
         self._feature_std = profile.std().replace(0, 1.0)
         self.index_ = pd.Series(np.arange(len(self.tracks_)), index=self.tracks_["track_id"])
         self._search_text = (
-            self.tracks_["track_name"].str.lower() + " " + self.tracks_["artists"].str.lower()
+            self.tracks_["track_name"].str.lower()
+            + " "
+            + self.tracks_["artists"].str.lower()
+            + " "
+            + self.tracks_["album_name"].fillna("").str.lower()
         )
+        self._song_group = self.tracks_["song_group"].to_numpy()
         return self
 
     # -------------------------------------------------------------- helpers
@@ -96,7 +101,7 @@ class ContentRecommender:
         return vec / (np.linalg.norm(vec) + 1e-12)
 
     def search(self, query: str, limit: int = 20) -> pd.DataFrame:
-        """Case-insensitive search over title and artists, most popular first."""
+        """Case-insensitive search over title, artists and album, most popular first."""
         terms = query.lower().split()
         if not terms:
             return self.tracks_.head(0)
@@ -113,10 +118,19 @@ class ContentRecommender:
         diversity: float | None = None,
         candidate_mask: np.ndarray | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Core ranking routine. Returns (track indices, similarity scores)."""
+        """Core ranking routine. Returns (track indices, similarity scores).
+
+        The seeds themselves, and any other version of a seed song (live,
+        acoustic, remix...), are never recommended.
+        """
         diversity = self.diversity if diversity is None else diversity
+        if k < 1:
+            raise ValueError(f"k must be at least 1, got {k}")
+        if not 0.0 <= diversity <= 1.0:
+            raise ValueError(f"diversity must be between 0 and 1, got {diversity}")
+        seed_idx = np.asarray(seed_idx)
         sims = self.vectors_ @ self.profile(seed_idx)
-        sims[np.asarray(seed_idx)] = -np.inf
+        sims[np.isin(self._song_group, self._song_group[seed_idx])] = -np.inf
         if candidate_mask is not None:
             sims[~candidate_mask] = -np.inf
         n_valid = int(np.isfinite(sims).sum())
