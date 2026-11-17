@@ -129,3 +129,18 @@ def test_load_raw_rejects_wrong_schema(tmp_path):
     pd.DataFrame({"track_id": ["a"]}).to_csv(bad, index=False)
     with pytest.raises(ValueError, match="missing columns"):
         load_raw(bad)
+
+
+def test_falls_back_to_pickle_when_parquet_is_blocked(raw, tmp_path, monkeypatch):
+    def blocked(*args, **kwargs):
+        raise ImportError("DLL load failed: blocked by Application Control")
+
+    monkeypatch.setattr(pd.DataFrame, "to_parquet", blocked)
+    monkeypatch.setattr(pd, "read_parquet", blocked)
+    raw_csv = tmp_path / "raw.csv"
+    raw.to_csv(raw_csv, index=False)
+    out = tmp_path / "processed" / "tracks.parquet"
+    build(raw_path=raw_csv, out_path=out)
+    assert not out.exists() and out.with_suffix(".pkl").exists()
+    loaded = load_tracks(out)
+    assert len(loaded) > 0 and isinstance(loaded.genres.iloc[0], list)

@@ -162,24 +162,55 @@ def clean(raw: pd.DataFrame) -> tuple[pd.DataFrame, CleaningReport]:
     return df, report
 
 
+def _fallback_path(path: Path) -> Path:
+    return path.with_suffix(".pkl")
+
+
+def save_tracks(tracks: pd.DataFrame, path: Path = PROCESSED_PATH) -> Path:
+    """Write tracks as parquet, or as a pickle if no parquet engine can load.
+
+    Parquet support lives in a compiled extension of pyarrow, which some
+    locked-down machines (e.g. Windows Smart App Control) refuse to load.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        tracks.to_parquet(path, index=False)
+        _fallback_path(path).unlink(missing_ok=True)
+        return path
+    except ImportError as exc:
+        fallback = _fallback_path(path)
+        logger.warning("Parquet unavailable (%s); saving %s instead", exc, fallback.name)
+        tracks.to_pickle(fallback)
+        return fallback
+
+
 def build(raw_path: Path = RAW_PATH, out_path: Path = PROCESSED_PATH) -> CleaningReport:
-    """Run the full raw -> processed pipeline and write a parquet file."""
+    """Run the full raw -> processed pipeline and save the result."""
     tracks, report = clean(load_raw(raw_path))
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    tracks.to_parquet(out_path, index=False)
-    logger.info("Wrote %d tracks to %s", len(tracks), out_path)
+    written = save_tracks(tracks, out_path)
+    logger.info("Wrote %d tracks to %s", len(tracks), written)
     return report
 
 
+def processed_exists(path: Path = PROCESSED_PATH) -> bool:
+    return path.exists() or _fallback_path(path).exists()
+
+
 def load_tracks(path: Path = PROCESSED_PATH) -> pd.DataFrame:
-    df = pd.read_parquet(path)
+    fallback = _fallback_path(path)
+    try:
+        df = pd.read_parquet(path)
+    except (ImportError, FileNotFoundError):
+        if not fallback.exists():
+            raise
+        df = pd.read_pickle(fallback)
     df["genres"] = df["genres"].map(list)
     return df
 
 
 def ensure_tracks(path: Path = PROCESSED_PATH) -> pd.DataFrame:
     """Load processed tracks, downloading and building them if needed."""
-    if not path.exists():
+    if not processed_exists(path):
         download()
         build(out_path=path)
     return load_tracks(path)
