@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "music-recommender"
 version = "1.0.0"
-description = "Content-based music recommender on Spotify audio features, with offline evaluation and a Streamlit app."
+description = "AI DJ set builder and content-based music recommender on Spotify audio features, with offline evaluation and a Streamlit app."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

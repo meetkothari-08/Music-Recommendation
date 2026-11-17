@@ -30,3 +30,10 @@ def test_recommend_rejects_bad_arguments(args):
 def test_command_is_required():
     with pytest.raises(SystemExit):
         cli.main([])
+
+
+def test_djset_command_offline(capsys):
+    cli.main(["djset", "chill pop set that gets happy", "-n", "4", "--no-ai"])
+    out = capsys.readouterr().out
+    assert "Plan (built-in parser): chill -> happy, 4 tracks" in out
+    assert "Built-in coach" in out and "Transition 3" in out

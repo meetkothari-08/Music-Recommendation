@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import sys
 
 import pandas as pd
 
@@ -48,6 +49,41 @@ def _cmd_recommend(args: argparse.Namespace) -> None:
         print(out[["similarity", "track_name", "artists", "genres", "popularity"]].to_string())
 
 
+def _cmd_djset(args: argparse.Namespace) -> None:
+    from music_recommender import ContentRecommender
+    from music_recommender.coach import DJCoach, LLMClient
+    from music_recommender.dj import DJSetBuilder
+
+    rec = ContentRecommender().fit(data.ensure_tracks())
+    coach = DJCoach(None if args.no_ai else LLMClient.from_env())
+    plan = coach.plan(args.request, rec.features.genres)
+    if args.n:
+        plan.params["n_tracks"] = args.n
+    dj_set = DJSetBuilder(rec).build(plan.to_request())
+    notes = coach.explain(dj_set)
+
+    p = plan.params
+    genres = ", ".join(p["genres"]) or "any"
+    print(
+        f"Plan ({plan.source}): {p['start_mood']} -> {p['end_mood']}, {p['n_tracks']} tracks, "
+        f"{p['arc']} arc, genres: {genres}"
+    )
+    for note in plan.notes:
+        print(f"  note: {note}")
+    cols = ["position", "track_name", "artists", "bpm", "camelot", "energy", "mood"]
+    with pd.option_context("display.max_colwidth", 38, "display.width", 160):
+        print("\n" + dj_set.tracks[cols].to_string(index=False))
+    print(f"\n{notes.source}\n{notes.overview}\n")
+    for t in dj_set.transitions:
+        print(
+            f"--- Transition {t.position} [{t.rating}, {t.score:.0f}/100]: "
+            f"{t.from_track}  ->  {t.to_track}"
+        )
+        print(notes.tips[t.position] + "\n")
+    for w in notes.warnings:
+        print(f"note: {w}")
+
+
 def _positive_int(value: str) -> int:
     n = int(value)
     if n < 1:
@@ -63,6 +99,10 @@ def _unit_float(value: str) -> float:
 
 
 def main(argv: list[str] | None = None) -> None:
+    # Windows terminals default to a legacy code page that can't print many song titles.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(prog="music-rec", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
@@ -83,6 +123,12 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--diversity", type=_unit_float, default=0.3)
     p.add_argument("--new-artists", action="store_true", help="exclude the seed artists")
     p.set_defaults(func=_cmd_recommend)
+
+    p = sub.add_parser("djset", help="build a mood-journey DJ set with mixing tips")
+    p.add_argument("request", help='e.g. "chill house set that builds to a party, 10 songs"')
+    p.add_argument("-n", type=_positive_int, help="number of tracks (overrides the request)")
+    p.add_argument("--no-ai", action="store_true", help="use the built-in coach only")
+    p.set_defaults(func=_cmd_djset)
 
     args = parser.parse_args(argv)
     args.func(args)

@@ -42,6 +42,9 @@ REQUIRED_COLUMNS = [
     "explicit",
     "track_genre",
     *AUDIO_FEATURES,
+    "key",
+    "mode",
+    "time_signature",
 ]
 
 

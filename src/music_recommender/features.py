@@ -38,6 +38,7 @@ def genre_embeddings(multi_hot: np.ndarray, n_components: int = 24, seed: int = 
     Returns an array of shape ``(n_genres, n_components)`` with unit-norm rows.
     """
     counts = multi_hot.T @ multi_hot  # (G, G) co-occurrence, diagonal = genre size
+    counts = np.asarray(counts.toarray() if hasattr(counts, "toarray") else counts, dtype=float)
     total = counts.sum()
     row = counts.sum(axis=1, keepdims=True)
     with np.errstate(divide="ignore", invalid="ignore"):
@@ -62,9 +63,9 @@ class FeatureBuilder:
         self.quantiles_ = QuantileTransformer(
             n_quantiles=n_quantiles, output_distribution="normal", random_state=self.seed
         ).fit(tracks[AUDIO_FEATURES].to_numpy(dtype=float))
-        self.mlb_ = MultiLabelBinarizer().fit(tracks["genres"])
+        self.mlb_ = MultiLabelBinarizer(sparse_output=True).fit(tracks["genres"])
         if self.genre_mode == "embedding":
-            multi_hot = self.mlb_.transform(tracks["genres"]).astype(float)
+            multi_hot = self.mlb_.transform(tracks["genres"]).astype(np.float32)
             self.genre_vectors_ = genre_embeddings(multi_hot, self.n_genre_components, self.seed)
         return self
 
@@ -77,13 +78,14 @@ class FeatureBuilder:
         return self.quantiles_.transform(tracks[AUDIO_FEATURES].to_numpy(dtype=float))
 
     def genre_matrix(self, tracks: pd.DataFrame) -> np.ndarray:
-        multi_hot = self.mlb_.transform(tracks["genres"]).astype(float)
+        # Sparse float32 keeps memory low: a dense int64 matrix would be ~70 MB.
+        multi_hot = self.mlb_.transform(tracks["genres"]).astype(np.float32)
         if self.genre_mode == "embedding":
-            return normalize(multi_hot @ self.genre_vectors_)
-        return normalize(multi_hot)
+            return normalize(multi_hot @ self.genre_vectors_.astype(np.float32))
+        return normalize(multi_hot).toarray()
 
     def transform(self, tracks: pd.DataFrame) -> np.ndarray:
-        audio = self.audio_matrix(tracks) / np.sqrt(len(AUDIO_FEATURES))
+        audio = (self.audio_matrix(tracks) / np.sqrt(len(AUDIO_FEATURES))).astype(np.float32)
         blocks = [self.audio_weight * audio]
         if self.genre_weight > 0:
             blocks.append(self.genre_weight * self.genre_matrix(tracks))

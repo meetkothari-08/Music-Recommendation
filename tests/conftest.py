@@ -50,6 +50,9 @@ def make_raw(
                         "liveness": 0.1 + rng.random() * 0.1,
                         "valence": v,
                         "tempo": tempo + rng.normal(0, 3),
+                        "key": int(rng.integers(0, 12)),
+                        "mode": int(rng.integers(0, 2)),
+                        "time_signature": 4,
                         "track_genre": genre,
                     }
                 )
